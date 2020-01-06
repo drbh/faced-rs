@@ -8,6 +8,5 @@ edition = "2018"
 
 [dependencies]
 tensorflow = "0.14.0"
-random = "0.12.2"
 image = "0.22.3"
 ndarray = "0.13.0"
