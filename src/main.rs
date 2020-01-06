@@ -1,7 +1,9 @@
-#![allow(non_snake_case, unused_variables)]
+#![allow(dead_code, non_snake_case, unused_variables)]
 
 extern crate image;
 extern crate tensorflow;
+use crate::image::GenericImageView;
+use image::imageops;
 use std::fs::File;
 use std::io::Read;
 use tensorflow::Graph;
@@ -14,11 +16,14 @@ use tensorflow::Tensor;
 
 const YOLO_SIZE: u64 = 288;
 const CORRECTOR_SIZE: u64 = 50;
-// const YOLO_TARGET: i32 = 9;
+const YOLO_TARGET: i32 = 9;
+const MARGIN: f32 = 0.5;
+const FLT_TO_INT_SCALAR: f32 = 100_000.0;
 
 #[derive(Debug)]
 struct FaceDetector {
     graph: Graph,
+    corrector: FaceCorrector,
     sess: Session,
     prob: Operation,
     img: Operation,
@@ -60,6 +65,8 @@ impl FaceDetector {
             graph: graph,
             sess: session,
 
+            corrector: FaceCorrector::init(),
+
             img: img,
             training: training,
             prob: prob,
@@ -75,13 +82,38 @@ impl FaceDetector {
         }
     }
 
-    fn predict(&self) -> (f64, f64, f64, f64) {
-        let tensor_training = <Tensor<bool>>::new(&[]);
-        let empty_img = <Tensor<f32>>::new(&[1, YOLO_SIZE, YOLO_SIZE, 3]);
+    fn predict(&self, img: &str) -> Vec<(f32, f32, f32, f32, f32)> {
+        // RBG effected by filter on resize - does not match CV2 perfectly
+        let mut raw_im = image::open(img).unwrap();
 
+        let mut im = raw_im.resize_exact(
+            YOLO_SIZE as u32,
+            YOLO_SIZE as u32,
+            image::FilterType::Nearest,
+        );
+        let rgb = im.to_rgb();
+        let mut counter = 0;
+
+        let mut values: Vec<f32> = vec![];
+
+        for _rb in rgb.pixels() {
+            let r = _rb[0] as f32 / 255.0;
+            let g = _rb[1] as f32 / 255.0;
+            let b = _rb[2] as f32 / 255.0;
+            values.push(r);
+            values.push(g);
+            values.push(b);
+            counter += 1;
+        }
+
+        let tensor_train: Tensor<f32> = <Tensor<f32>>::new(&[1, YOLO_SIZE, YOLO_SIZE, 3])
+            .with_values(&values)
+            .unwrap();
+
+        let tensor_training = <Tensor<bool>>::new(&[]);
         let mut step = SessionRunArgs::new();
 
-        step.add_feed(&self.img, 0, &empty_img);
+        step.add_feed(&self.img, 0, &tensor_train);
         step.add_feed(&self.training, 0, &tensor_training);
 
         let prob_output_token = step.request_fetch(&self.prob, 0);
@@ -98,20 +130,78 @@ impl FaceDetector {
         let w_output_tensor = step.fetch::<f32>(w_output_token).unwrap();
         let h_output_tensor = step.fetch::<f32>(h_output_token).unwrap();
 
-        // img_h, img_w, _ = frame.shape
-        // resize the outputs
+        // _absolute_bboxes
+        let mut _bboxes = vec![];
+        for n in 1..prob_output_tensor.len() {
+            let g = prob_output_tensor[n];
+            if g > 0.83 {
+                let row = ((n / 9) as f64).floor() as f32;
+                let col = (n % 9) as f32;
 
-        println!("{:#?}", prob_output_tensor);
-        println!("{:#?}", x_center_output_tensor);
-        println!("{:#?}", y_center_output_tensor);
-        println!("{:#?}", w_output_tensor);
-        println!("{:#?}", h_output_tensor);
+                let bbox = vec![
+                    row + x_center_output_tensor[n],
+                    col + y_center_output_tensor[n],
+                    w_output_tensor[n],
+                    h_output_tensor[n],
+                    g,
+                ];
+                _bboxes.push(bbox);
+            }
+        }
 
-        // bboxes = self._absolute_bboxes(pred, frame, thresh)
+        let img_w = raw_im.width() as f32;
+        let img_h = raw_im.height() as f32;
+        // println!("{} {}", img_w, img_h);
+        let mut scaled_bboxes = vec![];
+        for _box in _bboxes {
+            let new_box = vec![
+                ((_box[0] / YOLO_TARGET as f32) * img_w).floor() as i32,
+                ((_box[1] / YOLO_TARGET as f32) * img_h).floor() as i32,
+                (_box[2] * img_w).floor() as i32,
+                (_box[3] * img_h).floor() as i32,
+                (_box[4] * FLT_TO_INT_SCALAR) as i32,
+            ];
+
+            scaled_bboxes.push(new_box);
+        }
+
+        let mut results = vec![];
+        let mut counter = 0;
+        for _box in scaled_bboxes {
+            let xmin = (_box[0] as f32 - _box[2] as f32 / 2.0) - MARGIN * _box[2] as f32;
+            let xmax = (_box[0] as f32 + _box[2] as f32 / 2.0) + MARGIN * _box[2] as f32;
+
+            let ymin = (_box[1] as f32 - _box[3] as f32 / 2.0) - MARGIN * _box[3] as f32;
+            let ymax = (_box[1] as f32 + _box[3] as f32 / 2.0) + MARGIN * _box[3] as f32;
+
+            // println!("{} {} {} {}", xmin, ymin, xmax, ymax);
+
+            // get face and pass it to the correcter
+            let sub_image = imageops::crop(
+                &mut raw_im,
+                xmin as u32,
+                ymin as u32,
+                (xmax - xmin) as u32,
+                (ymax - ymin) as u32,
+            );
+
+            // println!("{:#?}", sub_image.dimensions());
+
+            let (_x, _y, _w, _h) = self.corrector.predict(sub_image);
+
+            results.push((
+                _x as f32 + xmin,
+                _y as f32 + ymin,
+                _w as f32,
+                _h as f32,
+                _box[4] as f32 / FLT_TO_INT_SCALAR,
+            ));
+            counter += 1;
+        }
         // bboxes = self._correct(frame, bboxes)
         // bboxes = self._nonmax_supression(bboxes)
 
-        (0.0, 0.0, 0.0, 0.0)
+        results
     }
 }
 
@@ -162,9 +252,36 @@ impl FaceCorrector {
         }
     }
 
-    fn predict(&self) -> (f64, f64, f64, f64) {
+    fn predict(&self, frame: image::SubImage<&mut image::DynamicImage>) -> (i32, i32, i32, i32) {
+        let og = frame.to_image();
+
+        let img_w = og.width() as f32;
+        let img_h = og.height() as f32;
+
+        let mut rgb = imageops::resize(
+            &og,
+            CORRECTOR_SIZE as u32,
+            CORRECTOR_SIZE as u32,
+            image::FilterType::Nearest,
+        );
+
+        let mut counter = 0;
+        let mut values: Vec<f32> = vec![];
+        for _rb in rgb.pixels() {
+            let r = _rb[0] as f32 / 255.0;
+            let g = _rb[1] as f32 / 255.0;
+            let b = _rb[2] as f32 / 255.0;
+            values.push(r);
+            values.push(g);
+            values.push(b);
+            counter += 1;
+        }
+
+        let empty_img: Tensor<f32> = <Tensor<f32>>::new(&[1, CORRECTOR_SIZE, CORRECTOR_SIZE, 3])
+            .with_values(&values)
+            .unwrap();
+
         let tensor_training = <Tensor<bool>>::new(&[]);
-        let empty_img = <Tensor<f32>>::new(&[1, CORRECTOR_SIZE, CORRECTOR_SIZE, 3]);
 
         let mut step = SessionRunArgs::new();
 
@@ -183,19 +300,19 @@ impl FaceCorrector {
         let W_output_tensor = step.fetch::<f32>(W_output_token).unwrap();
         let H_output_tensor = step.fetch::<f32>(H_output_token).unwrap();
 
-        // img_h, img_w, _ = frame.shape
         // resize the outputs
-
-        println!("{:#?}", X_output_tensor);
-        println!("{:#?}", Y_output_tensor);
-        println!("{:#?}", W_output_tensor);
-        println!("{:#?}", H_output_tensor);
-        (0.0, 0.0, 0.0, 0.0)
+        let _x = (X_output_tensor[0] * img_w).floor() as i32;
+        let _y = (Y_output_tensor[0] * img_h).floor() as i32;
+        let _w = (W_output_tensor[0] * img_w).floor() as i32;
+        let _h = (H_output_tensor[0] * img_h).floor() as i32;
+        (_x, _y, _w, _h)
     }
 }
 
 fn main() {
     let d = FaceDetector::init();
-    let fc = FaceCorrector::init();
-    fc.predict();
+    let mut results = d.predict("./images/people.jpg");
+    println!("{:#?}", results);
+    results = d.predict("./images/phelps.jpg");
+    println!("{:#?}", results);
 }
