@@ -12,13 +12,14 @@ use tensorflow::SessionOptions;
 use tensorflow::SessionRunArgs;
 use tensorflow::Tensor;
 
-//
+// set some constants (for tensor size and etc)
 const YOLO_SIZE: u64 = 288;
 const CORRECTOR_SIZE: u64 = 50;
 const YOLO_TARGET: i32 = 9;
 const MARGIN: f32 = 0.5;
 const FLT_TO_INT_SCALAR: f32 = 100_000.0;
 
+// the main app struct
 #[derive(Debug)]
 pub struct FaceDetector {
     graph: Graph,
@@ -36,6 +37,7 @@ pub struct FaceDetector {
     rows: i32,
 }
 
+// the second - correction model struct
 #[derive(Debug)]
 pub struct FaceCorrector {
     graph: Graph,
@@ -176,6 +178,7 @@ impl FaceDetector {
             scaled_bboxes.push(new_box);
         }
 
+        // bboxes = self._correct(frame, bboxes)
         let mut results = vec![];
         // let mut counter = 0;
         for _box in scaled_bboxes {
@@ -209,7 +212,6 @@ impl FaceDetector {
             ));
             // counter += 1;
         }
-        // bboxes = self._correct(frame, bboxes)
         // bboxes = self._nonmax_supression(bboxes)
 
         results
@@ -304,6 +306,8 @@ impl FaceCorrector {
         let _y = (Y_output_tensor[0] * img_h).floor() as i32;
         let _w = (W_output_tensor[0] * img_w).floor() as i32;
         let _h = (H_output_tensor[0] * img_h).floor() as i32;
+
+        // these are centers and sizes
         (_x, _y, _w, _h)
     }
 }
