@@ -12,6 +12,10 @@ use tensorflow::SessionOptions;
 use tensorflow::SessionRunArgs;
 use tensorflow::Tensor;
 
+mod utils;
+use crate::facedrs::utils::iou;
+// use crate::utils::iou;
+
 // set some constants (for tensor size and etc)
 const YOLO_SIZE: u64 = 288;
 const CORRECTOR_SIZE: u64 = 50;
@@ -95,9 +99,11 @@ impl FaceDetector {
         }
     }
 
-    pub fn predict(&self, img: &str) -> Vec<(f32, f32, f32, f32, f32)> {
+    // pub fn predict(&self, img: &str) -> Vec<(f32, f32, f32, f32, f32)> {
+    pub fn predict(&self, img: &str) -> Vec<Vec<f32>> {
+        // pub fn predict(&self, img: &str) -> f32 {
         // RBG effected by filter on resize - does not match CV2 perfectly
-        let mut raw_im = image::open(img).unwrap();
+        let raw_im = image::open(img).unwrap();
 
         let im = raw_im.resize_exact(
             YOLO_SIZE as u32,
@@ -143,11 +149,71 @@ impl FaceDetector {
         let w_output_tensor = step.fetch::<f32>(w_output_token).unwrap();
         let h_output_tensor = step.fetch::<f32>(h_output_token).unwrap();
 
-        // _absolute_bboxes
+        let absolute_bboxes = self._absolute_bboxes(
+            prob_output_tensor,
+            x_center_output_tensor,
+            y_center_output_tensor,
+            w_output_tensor,
+            h_output_tensor,
+            raw_im.clone(),
+            0.83,
+        );
+        let corrected_bboxes = self._correct(raw_im.clone(), absolute_bboxes);
+        let non_suppressed_boxes = self._nonmax_supression(corrected_bboxes.clone(), 0.2);
+        non_suppressed_boxes
+    }
+
+    pub fn _correct(
+        &self,
+        mut raw_im: image::DynamicImage,
+        scaled_bboxes: Vec<Vec<i32>>,
+    ) -> Vec<Vec<f32>> {
+        let mut results = vec![];
+        // let mut counter = 0;
+        for _box in scaled_bboxes {
+            let xmin = (_box[0] as f32 - _box[2] as f32 / 2.0) - MARGIN * _box[2] as f32;
+            let xmax = (_box[0] as f32 + _box[2] as f32 / 2.0) + MARGIN * _box[2] as f32;
+
+            let ymin = (_box[1] as f32 - _box[3] as f32 / 2.0) - MARGIN * _box[3] as f32;
+            let ymax = (_box[1] as f32 + _box[3] as f32 / 2.0) + MARGIN * _box[3] as f32;
+
+            // get face and pass it to the correcter
+            let sub_image = imageops::crop(
+                &mut raw_im,
+                xmin as u32,
+                ymin as u32,
+                (xmax - xmin) as u32,
+                (ymax - ymin) as u32,
+            );
+
+            let (_x, _y, _w, _h) = self.corrector.predict(sub_image);
+
+            results.push(vec![
+                _x as f32 + xmin,
+                _y as f32 + ymin,
+                _w as f32,
+                _h as f32,
+                _box[4] as f32 / FLT_TO_INT_SCALAR,
+            ]);
+        }
+        results
+    }
+
+    pub fn _absolute_bboxes(
+        &self,
+        prob_output_tensor: tensorflow::Tensor<f32>,
+        x_center_output_tensor: tensorflow::Tensor<f32>,
+        y_center_output_tensor: tensorflow::Tensor<f32>,
+        w_output_tensor: tensorflow::Tensor<f32>,
+        h_output_tensor: tensorflow::Tensor<f32>,
+        raw_im: image::DynamicImage,
+        thresh: f32,
+    ) -> Vec<Vec<i32>> {
+        // ) -> f32 {
         let mut _bboxes = vec![];
         for n in 1..prob_output_tensor.len() {
             let g = prob_output_tensor[n];
-            if g > 0.83 {
+            if g > thresh {
                 let row = ((n / 9) as f64).floor() as f32;
                 let col = (n % 9) as f32;
 
@@ -177,44 +243,52 @@ impl FaceDetector {
 
             scaled_bboxes.push(new_box);
         }
+        scaled_bboxes
+    }
 
-        // bboxes = self._correct(frame, bboxes)
-        let mut results = vec![];
-        // let mut counter = 0;
-        for _box in scaled_bboxes {
-            let xmin = (_box[0] as f32 - _box[2] as f32 / 2.0) - MARGIN * _box[2] as f32;
-            let xmax = (_box[0] as f32 + _box[2] as f32 / 2.0) + MARGIN * _box[2] as f32;
+    pub fn _nonmax_supression(&self, bboxes: Vec<Vec<f32>>, thresh: f32) -> Vec<Vec<f32>> {
+        let NONE_VALUE = 0;
+        let SUPPRESSED = 1;
+        let NON_SUPPRESSED = 2;
 
-            let ymin = (_box[1] as f32 - _box[3] as f32 / 2.0) - MARGIN * _box[3] as f32;
-            let ymax = (_box[1] as f32 + _box[3] as f32 / 2.0) + MARGIN * _box[3] as f32;
+        let N = bboxes.len();
 
-            // println!("{} {} {} {}", xmin, ymin, xmax, ymax);
+        let mut status = vec![NONE_VALUE; N];
+        for i in 0..N {
+            // unimplemented!();
+            if status[i] != NONE_VALUE {
+                continue;
+            }
 
-            // get face and pass it to the correcter
-            let sub_image = imageops::crop(
-                &mut raw_im,
-                xmin as u32,
-                ymin as u32,
-                (xmax - xmin) as u32,
-                (ymax - ymin) as u32,
-            );
+            let mut curr_max_p = bboxes[i][bboxes[i].len() - 1];
+            let mut curr_max_index = i;
 
-            // println!("{:#?}", sub_image.dimensions());
+            for j in i + 1..N {
+                if status[j] != NONE_VALUE {
+                    continue;
+                }
+                let metric = iou(bboxes[i].clone(), bboxes[j].clone());
 
-            let (_x, _y, _w, _h) = self.corrector.predict(sub_image);
-
-            results.push((
-                _x as f32 + xmin,
-                _y as f32 + ymin,
-                _w as f32,
-                _h as f32,
-                _box[4] as f32 / FLT_TO_INT_SCALAR,
-            ));
-            // counter += 1;
+                if metric > thresh {
+                    if bboxes[j][bboxes[j].len() - 1] > curr_max_p {
+                        status[curr_max_index] = SUPPRESSED;
+                        curr_max_p = bboxes[j][bboxes[j].len() - 1];
+                        curr_max_index = j;
+                    } else {
+                        status[j] = SUPPRESSED;
+                    }
+                }
+            }
+            status[curr_max_index] = NON_SUPPRESSED
         }
-        // bboxes = self._nonmax_supression(bboxes)
 
-        results
+        let mut non_suppressed_boxes = vec![];
+        for i in 0..N {
+            if status[i] == NON_SUPPRESSED {
+                non_suppressed_boxes.push(bboxes[i].clone());
+            }
+        }
+        non_suppressed_boxes
     }
 }
 
